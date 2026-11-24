@@ -1,0 +1,1631 @@
+name: Build Flutter
+run-name: Build ${{ inputs.tag }} (${{ inputs.build_type }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+      build_type:
+        description: release atau debug
+        default: release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+      PUB_ENVIRONMENT: bot_build
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Kunci cache mingguan
+        run: echo "WK=$(date +%G-%V)" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/native
+            ~/.android/build-cache
+            ~/.pub-cache
+          key: gradle-pub-${{ runner.os }}-${{ env.WK }}
+          restore-keys: |
+            gradle-pub-${{ runner.os }}-
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "source.*" --dir source
+          cd source
+          F=$(ls source.* | head -1)
+          MAGIC=$(head -c 4 "$F" | od -An -tx1 | tr -d ' \n')
+          case "$MAGIC" in
+            504b*) unzip -q -o "$F" || 7z x -y "$F" > /dev/null ;;
+            1f8b*) tar xzf "$F" ;;
+            377abcaf) 7z x -y "$F" > /dev/null ;;
+            52617221) 7z x -y "$F" > /dev/null 2>&1 || bsdtar -xf "$F" 2>/dev/null || { sudo apt-get install -y -qq unrar-free > /dev/null 2>&1; unrar-free -x "$F" . > /dev/null; } ;;
+            *) tar xf "$F" ;;
+          esac
+          rm -f "$F"
+          # pilih pubspec project Flutter yang paling cocok (utamakan yang punya sdk: flutter + folder android/web)
+          ALL=$(find . -name pubspec.yaml -not -path '*/__MACOSX/*' -not -path '*/.dart_tool/*' -not -path '*/ephemeral/*' -not -path '*/example/*' -not -path '*/.symlinks/*' -not -path '*/node_modules/*' -not -path '*/.pub-cache/*' | awk '{print length, $0}' | sort -n | cut -d' ' -f2- || true)
+          PUB=""
+          for f in $ALL; do d=$(dirname "$f"); if grep -qE 'sdk:[[:space:]]*flutter' "$f" && { [ -d "$d/android" ] || [ -d "$d/web" ]; }; then PUB="$f"; break; fi; done
+          if [ -z "$PUB" ]; then for f in $ALL; do if grep -qE 'sdk:[[:space:]]*flutter' "$f"; then PUB="$f"; break; fi; done; fi
+          [ -z "$PUB" ] && PUB=$(echo "$ALL" | head -1)
+          if [ -z "$PUB" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Zip folder project Flutter yang ada pubspec.yaml."
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$PUB")" && pwd)
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+      - name: Siapkan project (aset, signing, bersih-bersih)
+        run: |
+          cd "$PROJECT_ROOT"
+          # aset (folder / .env) yang dideklarasi di pubspec tetapi tidak ada -> dibuat kosong supaya build tidak gagal
+          awk '/^flutter:/{f=1;next} f&&/^[^ #]/{f=0} f' pubspec.yaml | grep -E '^[[:space:]]+-[[:space:]]+[^ ]' | sed -E 's/^[[:space:]]+-[[:space:]]+//; s/[[:space:]]+#.*//' | tr -d "\"'" | while read -r A; do
+            case "$A" in
+              */) [ -d "$A" ] || { mkdir -p "$A"; touch "$A/.gitkeep"; echo "::warning::Folder aset $A tidak ada, dibuat kosong"; } ;;
+              *.env|.env*|*/.env*) [ -f "$A" ] || { mkdir -p "$(dirname "$A")"; touch "$A"; echo "::warning::File $A tidak ada, dibuat kosong"; } ;;
+              *.*) [ -e "$A" ] || { mkdir -p "$(dirname "$A")"; touch "$A"; echo "::warning::Aset $A tidak ada di ZIP, dibuat kosong (gambar/file ini akan kosong di app)"; } ;;
+            esac
+          done
+          # hapus file build lama dari ZIP agar tidak bentrok
+          rm -rf build .dart_tool android/.gradle android/app/build ios/Pods 2>/dev/null || true
+          # signing release: key.properties dirujuk tetapi tidak ada -> buat keystore sementara
+          if grep -qs 'key.properties' android/app/build.gradle android/app/build.gradle.kts && [ ! -f android/key.properties ]; then
+            keytool -genkeypair -keystore /tmp/upload.jks -storepass android -keypass android -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Build" > /dev/null 2>&1 || true
+            {
+              echo "storePassword=android"
+              echo "keyPassword=android"
+              echo "keyAlias=key"
+              echo "storeFile=/tmp/upload.jks"
+            } > android/key.properties
+            echo "::notice::key.properties tidak ada, dibuat otomatis (keystore sementara)"
+          fi
+          # androidx wajib untuk plugin Flutter modern; base lama sering belum migrasi
+          if [ -d android ]; then
+            if [ -f android/gradle.properties ]; then
+              grep -q '^android.useAndroidX=' android/gradle.properties || echo 'android.useAndroidX=true' >> android/gradle.properties
+              grep -q '^android.enableJetifier=' android/gradle.properties || echo 'android.enableJetifier=true' >> android/gradle.properties
+            else
+              { echo 'android.useAndroidX=true'; echo 'android.enableJetifier=true'; } > android/gradle.properties
+            fi
+            [ -f android/local.properties ] || [ -z "$ANDROID_HOME" ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          fi
+
+      - name: Deteksi versi Dart minimal project
+        run: |
+          cd "$PROJECT_ROOT"
+          L=$(grep -E '^[[:space:]]+sdk:[[:space:]]*.?[>=^<]' pubspec.yaml | head -1 | grep -oE '[0-9]+[.][0-9]+' | head -1 || true)
+          if [ -n "$L" ]; then
+            echo "DARTMIN=$(( ${L%%.*} * 100 + ${L##*.} ))" >> "$GITHUB_ENV"
+            echo "Dart minimal project: $L (versi Flutter yang terlalu lama dilewati)"
+          fi
+          # versi Flutter yang dikunci project (FVM / pubspec environment)
+          FV=""
+          [ -f .fvmrc ] && FV=$(grep -oE '"flutter"[[:space:]]*:[[:space:]]*"[0-9]+[.][0-9]+[.][0-9]+"' .fvmrc | grep -oE '[0-9]+[.][0-9]+[.][0-9]+' | head -1 || true)
+          if [ -z "$FV" ] && [ -f .fvm/fvm_config.json ]; then FV=$(grep -oE '"flutterSdkVersion"[[:space:]]*:[[:space:]]*"[0-9]+[.][0-9]+[.][0-9]+"' .fvm/fvm_config.json | grep -oE '[0-9]+[.][0-9]+[.][0-9]+' | head -1 || true); fi
+          if [ -z "$FV" ]; then FV=$(awk '/^environment:/{e=1;next} e&&/^[^ #]/{e=0} e' pubspec.yaml | grep -E '^[[:space:]]+flutter:[[:space:]]*.?[0-9]+[.][0-9]+[.][0-9]+.?[[:space:]]*$' | grep -oE '[0-9]+[.][0-9]+[.][0-9]+' | head -1 || true); fi
+          if [ -n "$FV" ]; then echo "FVM_VERSION=$FV" >> "$GITHUB_ENV"; echo "Project mengunci Flutter $FV (dicoba pertama)"; fi
+          # Dart lama (batas atas < 3.0): hanya Flutter lama yang bisa
+          UB=$(awk '/^environment:/{e=1;next} e&&/^[^ #]/{e=0} e' pubspec.yaml | grep -E '^[[:space:]]+sdk:' | head -1 | grep -oE '<[[:space:]]*[0-9]+[.][0-9]+' | grep -oE '[0-9]+[.][0-9]+' | head -1 || true)
+          if [ -n "$UB" ] && [ "$(( ${UB%%.*} * 100 + ${UB##*.} ))" -le 300 ]; then
+            LMJ=${L%%.*}; LMN=${L##*.}
+            [ -z "$L" ] && { LMJ=2; LMN=19; }
+            LM=$(( LMJ * 100 + LMN ))
+            if [ "$LM" -ge 219 ]; then LF=3.7.12; elif [ "$LM" -eq 218 ]; then LF=3.3.10; elif [ "$LM" -eq 217 ]; then LF=3.0.5; else LF=2.10.5; fi
+            echo "LEGACY_FLUTTER=$LF" >> "$GITHUB_ENV"
+            echo "::notice::Project memakai Dart lama (sdk < $UB): memakai Flutter $LF"
+          fi
+          # pilih versi Flutter paling dekat (tertua yang Dart-nya masih cukup) -> base lama lgsg kena sekali coba, gak perlu turun satu-satu dari yang paling baru
+          if [ -n "$DARTMIN" ] && [ -z "$LEGACY_FLUTTER" ] && [ -z "$FV" ]; then
+            BEST=""; BESTD=999999
+            IFS=';' read -ra __PAIRS <<< "3.38.x|310;3.35.x|309;3.32.x|308;3.29.x|307;3.27.x|306;3.24.x|305;3.22.x|304;3.19.x|303;3.16.x|302;3.13.x|301;3.10.x|300;3.7.x|219;3.3.x|218;3.0.x|217"
+            for P in "${__PAIRS[@]}"; do
+              CV="${P%%|*}"; CD="${P##*|}"
+              if [ "$CD" -ge "$DARTMIN" ] && [ "$CD" -lt "$BESTD" ]; then BEST="$CV"; BESTD="$CD"; fi
+            done
+            if [ -n "$BEST" ]; then
+              echo "NEAR_VERSION=$BEST" >> "$GITHUB_ENV"
+              echo "::notice::Dicoba duluan Flutter $BEST (paling cocok requirement Dart project, hemat waktu build)"
+            fi
+          fi
+
+      - name: Auto-fix minSdk (minimal 24)
+        run: |
+          cd "$PROJECT_ROOT"
+          cat > /tmp/fixminsdk.py <<'PY'
+          import re, glob, os
+          t = int(os.environ['MS'])
+          files = glob.glob('android/app/build.gradle') + glob.glob('android/app/build.gradle.kts')
+          rx = re.compile(r'(minSdk(?:Version)?)(\s*=?\s*)(\d+|flutter\.minSdkVersion)')
+          def fix(m):
+              v = m.group(3)
+              if v.isdigit() and int(v) >= t:
+                  return m.group(0)
+              return m.group(1) + m.group(2) + str(t)
+          for f in files:
+              src = open(f, encoding='utf-8').read()
+              out = rx.sub(fix, src)
+              if out != src:
+                  open(f, 'w', encoding='utf-8').write(out)
+                  print('minSdk dinaikkan ke', t, 'di', f)
+          PY
+          cat > /tmp/flavor.py <<'PY2'
+          import re, glob
+          for f in glob.glob('android/app/build.gradle') + glob.glob('android/app/build.gradle.kts'):
+              t = open(f, encoding='utf-8').read()
+              i = t.find('productFlavors')
+              if i < 0:
+                  continue
+              m = re.search(r'(?:create|register)[(][ ]*"([A-Za-z0-9_]+)"[ ]*[)]|^[ ]*([A-Za-z0-9_]+)[ ]*[{]', t[t.find('{', i) + 1:], re.M)
+              if m:
+                  print(m.group(1) or m.group(2))
+                  break
+          PY2
+          MS=24 python3 /tmp/fixminsdk.py
+          cat > /tmp/fixns.py <<'PY3'
+          import re, glob
+          pkg = None
+          for mf in glob.glob('android/app/src/main/AndroidManifest.xml'):
+              t = open(mf, encoding='utf-8').read()
+              m = re.search(r'package="([^"]+)"', t)
+              if m:
+                  pkg = m.group(1)
+                  break
+          for f in glob.glob('android/app/build.gradle') + glob.glob('android/app/build.gradle.kts'):
+              s = open(f, encoding='utf-8').read()
+              if re.search(r'(?m)^\s*namespace\s*[=\s]', s):
+                  continue
+              m = re.search(r'applicationId\s*[=\s]*"([^"]+)"', s)
+              ns = m.group(1) if m else pkg
+              if not ns:
+                  continue
+              m2 = re.search(r'android\s*\{', s)
+              if not m2:
+                  continue
+              i = m2.end()
+              line = ('\n    namespace "' + ns + '"\n') if f.endswith('.gradle') else ('\n    namespace = "' + ns + '"\n')
+              open(f, 'w', encoding='utf-8').write(s[:i] + line + s[i:])
+              print('namespace ditambahkan:', ns, 'di', f)
+          PY3
+          python3 /tmp/fixns.py
+
+
+      - name: Deteksi Gradle/AGP project
+        run: |
+          cd "$PROJECT_ROOT"
+          GV=$(grep -o 'gradle-[0-9]*' android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null | head -1 | grep -o '[0-9]*$' || true)
+          AV=$(cat android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts 2>/dev/null | grep -oE 'com[.]android[.](application|tools[.]build:gradle)[^0-9]{0,40}[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+          echo "Gradle major: ${GV:-?}, AGP major: ${AV:-?}"
+          GVF=$(grep -oE 'gradle-[0-9]+[.][0-9]+' android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null | head -1 | sed 's/gradle-//' || true)
+          if [ -n "$GVF" ]; then
+            GJ=17
+            if [ "${GVF%%.*}" -lt 5 ]; then GJ=8; elif [ "${GVF%%.*}" -lt 7 ] || { [ "${GVF%%.*}" -eq 7 ] && [ "${GVF##*.}" -lt 3 ]; }; then GJ=11; fi
+            if [ "$GJ" != "17" ]; then
+              JH=$(printenv "JAVA_HOME_${GJ}_X64" || true)
+              if [ -n "$JH" ]; then
+                echo "JAVA_HOME=$JH" >> "$GITHUB_ENV"; echo "$JH/bin" >> "$GITHUB_PATH"
+                echo "::notice::Gradle $GVF butuh Java $GJ, dipakai"
+              fi
+            fi
+          fi
+          if [ "${GV:-0}" -ge 9 ] || [ "${AV:-0}" -ge 9 ]; then
+            echo "PREFER_LATEST=1" >> "$GITHUB_ENV"
+            echo "::notice::Project Gradle/AGP 9+, mulai dari Flutter terbaru"
+          fi
+
+
+      - name: Bersihkan opsi Gradle usang (dihapus di AGP baru)
+        run: |
+          cd "$PROJECT_ROOT"
+          for f in android/gradle.properties; do
+            [ -f "$f" ] || continue
+            sed -i -E '/^[[:space:]]*android[.](enableDexingArtifactTransform([.]desugaring)?|enableD8([.]desugaring)?|enableR8|useDeprecatedNdk|enableUnitTestBinaryResources|enableBuildCache|enableAapt2|enableSeparateAnnotationProcessing)[[:space:]]*=/d' "$f"
+            echo "gradle.properties dibersihkan dari opsi usang"
+          done
+
+      - name: Optimasi Gradle
+        run: |
+          AV=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "${AV:-99}" -lt 8 ]; then sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost; fi
+          mkdir -p ~/.gradle
+          {
+            echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g'
+            echo 'org.gradle.parallel=true'
+            echo 'org.gradle.caching=true'
+            echo 'org.gradle.configureondemand=true'
+            echo 'org.gradle.vfs.watch=false'
+            echo 'kotlin.compiler.execution.strategy=in-process'
+            echo 'kotlin.incremental=true'
+            echo 'android.enableJetifier=false'
+          } >> ~/.gradle/gradle.properties
+          # lewati lintVital (lambat, tidak berpengaruh ke APK)
+          mkdir -p ~/.gradle/init.d
+          echo 'allprojects { tasks.configureEach { t -> if (t.name.startsWith("lintVital") || t.name.startsWith("lintAnalyze") || t.name.startsWith("lintReport")) { t.enabled = false } } }' > ~/.gradle/init.d/skiplint.gradle
+
+
+      - name: Setup Flutter legacy (Dart lama)
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER != ''
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '${{ env.LEGACY_FLUTTER }}'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter legacy (Dart lama)
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER != ''
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-l.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter legacy (Dart lama)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter legacy (Dart lama), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter versi project
+        if: env.BUILD_DONE != '1' && env.FVM_VERSION != '' && env.LEGACY_FLUTTER == ''
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '${{ env.FVM_VERSION }}'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter versi project
+        if: env.BUILD_DONE != '1' && env.FVM_VERSION != '' && env.LEGACY_FLUTTER == ''
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-p.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter versi project"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter versi project, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter otomatis (cocok era project)
+        if: env.BUILD_DONE != '1' && env.NEAR_VERSION != '' && env.FVM_VERSION == '' && env.LEGACY_FLUTTER == ''
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '${{ env.NEAR_VERSION }}'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter otomatis (cocok era project)
+        if: env.BUILD_DONE != '1' && env.NEAR_VERSION != '' && env.FVM_VERSION == '' && env.LEGACY_FLUTTER == ''
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-n.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter otomatis (cocok era project)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter otomatis (cocok era project), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter terbaru (prioritas)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST == '1' && env.LEGACY_FLUTTER == ''
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ''
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter terbaru (prioritas)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST == '1' && env.LEGACY_FLUTTER == ''
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-a.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter terbaru (prioritas)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter terbaru (prioritas), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.38.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 310
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.38.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 310
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-0.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.38.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.38.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.35.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 309
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.35.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 309
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-1.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.35.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.35.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.32.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 308
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.32.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 308
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-2.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.32.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.32.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.29.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 307
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.29.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 307
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-3.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.29.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.29.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.27.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 306
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.27.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 306
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-4.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.27.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.27.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.24.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 305
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.24.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 305
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-5.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.24.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.24.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.22.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 304
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.22.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 304
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-6.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.22.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.22.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.19.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 303
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.19.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 303
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-7.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.19.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.19.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.16.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 302
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.16.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 302
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-8.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.16.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.16.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.13.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 301
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.13.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.13.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 301
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-9.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.13.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.13.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.10.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 300
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.10.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.10.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 300
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-10.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.10.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.10.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.7.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 219
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.7.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.7.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 219
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-11.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.7.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.7.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.3.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 218
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.3.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.3.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 218
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-12.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.3.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.3.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.0.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 217
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.0.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.0.x
+        if: env.BUILD_DONE != '1' && env.LEGACY_FLUTTER == '' && fromJSON(env.DARTMIN || '0') <= 217
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-13.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.0.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.0.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter terbaru (terakhir)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST != '1' && env.LEGACY_FLUTTER == ''
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ''
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter terbaru (terakhir)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST != '1' && env.LEGACY_FLUTTER == ''
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          rm -f pubspec.lock
+          flutter --version
+          if [ ! -d android ]; then
+            echo "::notice::Folder android/ tidak ada, dibuat otomatis (flutter create)"
+            cp pubspec.yaml /tmp/pubspec.keep; [ -d lib ] && cp -r lib /tmp/lib.keep
+            flutter create . --platforms=android --project-name "$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -cd 'a-z0-9_')" --org com.base > /tmp/create.log 2>&1 || tail -5 /tmp/create.log
+            cp /tmp/pubspec.keep pubspec.yaml; [ -d /tmp/lib.keep ] && { rm -rf lib; cp -r /tmp/lib.keep lib; }
+          fi
+
+          LOG=/tmp/build-z.log
+          NT=0
+          SHRINK_OFF=''
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --split-debug-info=/tmp/dbg${SHRINK_OFF}"
+          fi
+          for t in 1 2 3; do
+            flutter pub get 2>&1 | tee $LOG
+            RC=${PIPESTATUS[0]}
+            [ "$RC" -eq 0 ] && break
+            grep -Eiq 'version solving|requires|incompatible|resolve' $LOG && ! grep -Eiq 'timed out|connection|socket|HandshakeException|5[0-9][0-9]' $LOG && break
+            echo "::warning::pub get gagal, coba lagi ($t/3)"; sleep 4
+          done
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk --no-pub $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              if [ "$NT" -lt 2 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP (5[0-9][0-9])|Unexpected end of stream|Remote host terminated' $LOG; then
+                NT=$((NT+1)); echo "::warning::Gangguan jaringan saat build, mengulang ($NT/2)"; sleep 5; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--no-shrink' && echo "$ARGS" | grep -q -- '--release' && grep -Eiq 'R8|minifyReleaseWithR8|Missing classes|proguard|shrinkReleaseRes|missing_rules' $LOG; then
+                ARGS="$ARGS --no-shrink"; echo "::notice::Shrink (R8) gagal, mengulang tanpa shrink"; continue
+              fi
+              if ! echo "$ARGS" | grep -q -- '--flavor' && grep -Eiq 'produce an .apk|flavor' $LOG; then
+                FL=$(python3 /tmp/flavor.py 2>/dev/null | head -1)
+                if [ -n "$FL" ]; then ARGS="$ARGS --flavor $FL"; echo "::notice::Project punya flavor, mengulang dengan --flavor $FL"; continue; fi
+              fi
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter terbaru (terakhir)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter terbaru (terakhir), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Cek hasil build
+        if: env.BUILD_OK != '1'
+        run: |
+          echo "::error::Build gagal. Versi Flutter yang dicoba: 3.38.x, 3.35.x, 3.32.x, 3.29.x, 3.27.x, 3.24.x, 3.22.x, 3.19.x, 3.16.x, 3.13.x, 3.10.x, 3.7.x, 3.3.x, 3.0.x, terbaru"
+          for f in /tmp/build-*.log; do
+            echo "=== $f ==="
+            grep -iE 'error|failed|went wrong|minimum|cannot be smaller' "$f" | tail -30 || true
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}
+          path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
