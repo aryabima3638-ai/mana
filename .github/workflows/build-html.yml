@@ -1,0 +1,253 @@
+name: Build HTML to APK
+run-name: Build ${{ inputs.tag }} (html)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p meta
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "icon.png" --pattern "meta.txt" --dir meta || true
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "source.*" --dir source
+          cd source
+          F=$(ls source.* | head -1)
+          MAGIC=$(head -c 4 "$F" | od -An -tx1 | tr -d ' \n')
+          case "$MAGIC" in
+            504b*) unzip -q -o "$F" || 7z x -y "$F" > /dev/null ;;
+            1f8b*) tar xzf "$F" ;;
+            377abcaf) 7z x -y "$F" > /dev/null ;;
+            52617221) 7z x -y "$F" > /dev/null 2>&1 || bsdtar -xf "$F" 2>/dev/null || { sudo apt-get install -y -qq unrar-free > /dev/null 2>&1; unrar-free -x "$F" . > /dev/null; } ;;
+            *) tar xf "$F" ;;
+          esac
+          rm -f "$F"
+          IDX=$(find . -iname index.html -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | awk '{print length, $0}' | sort -n | sed -n '1p' | cut -d' ' -f2- || true)
+          if [ -z "$IDX" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            echo "::error::index.html tidak ditemukan di dalam ZIP. Zip folder web yang berisi index.html."
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$IDX")" && pwd)
+          echo "WEB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Web root: $ROOT"
+
+      - name: Buat project Android (WebView)
+        run: |
+          set -e
+          H=$(echo "${{ inputs.tag }}" | md5sum | cut -c1-8)
+          META="$GITHUB_WORKSPACE/meta"
+          TITLE=""
+          [ -f "$META/meta.txt" ] && TITLE=$(head -1 "$META/meta.txt" | tr -cd '[:alnum:] _.-' | cut -c1-30 || true)
+          [ -z "$TITLE" ] && TITLE=$(grep -io '<title>[^<]*' "$WEB_ROOT/index.html" | head -1 | sed 's/<[tT][iI][tT][lL][eE]>//' | tr -cd '[:alnum:] _.-' | cut -c1-40 || true)
+          [ -z "$TITLE" ] && TITLE="Web App"
+          PLAT=$(ls "$ANDROID_HOME/platforms" | sed 's/android-//' | grep -E '^[0-9]+$' | sort -n | tail -1)
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          echo "Android platform $PLAT, build-tools $BT, title: $TITLE"
+          echo "APP_ID=com.htmlapk.a$H" >> "$GITHUB_ENV"
+          echo "APP_TITLE=$TITLE" >> "$GITHUB_ENV"
+          echo "COMPILE_SDK=$PLAT" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS=$BT" >> "$GITHUB_ENV"
+          A=/tmp/app
+          mkdir -p $A/app/src/main/java/com/htmlapk/web $A/app/src/main/assets/www $A/app/src/main/res/values
+          cp -r "$WEB_ROOT"/. $A/app/src/main/assets/www/
+          rm -rf $A/app/src/main/assets/www/__MACOSX
+          ICON_RES=@android:drawable/sym_def_app_icon
+          if [ -f "$META/icon.png" ]; then
+            for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              mkdir -p $A/app/src/main/res/mipmap-${d%%:*}
+              SZ=${d##*:}
+              OUT=$A/app/src/main/res/mipmap-${d%%:*}/ic_launcher.png
+              convert "$META/icon.png[0]" -background none -resize ${SZ}x${SZ}^ -gravity center -extent ${SZ}x${SZ} "PNG32:$OUT" 2>/dev/null                 || magick "$META/icon.png[0]" -background none -resize ${SZ}x${SZ}^ -gravity center -extent ${SZ}x${SZ} "PNG32:$OUT" 2>/dev/null                 || cp "$META/icon.png" "$OUT"
+            done
+            ICON_RES=@mipmap/ic_launcher
+          else
+            ICON_RES=@android:drawable/sym_def_app_icon
+          fi
+          echo "<resources><string name=\"app_name\">$TITLE</string></resources>" > $A/app/src/main/res/values/strings.xml
+          {
+            echo "android.suppressUnsupportedCompileSdk=$PLAT"
+            echo "org.gradle.jvmargs=-Xmx3g"
+            echo "org.gradle.parallel=true"
+            echo "org.gradle.caching=true"
+          } > $A/gradle.properties
+          cat > $A/settings.gradle <<'EOF'
+          pluginManagement {
+            repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'htmlapk'
+          include ':app'
+          EOF
+          cat > $A/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > $A/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'com.htmlapk.web'
+            compileSdk System.getenv('COMPILE_SDK').toInteger()
+            buildToolsVersion System.getenv('BUILD_TOOLS')
+            defaultConfig {
+              applicationId System.getenv('APP_ID')
+              minSdk 21
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+            }
+            signingConfigs {
+              release {
+                storeFile file(System.getenv('KS_FILE'))
+                storePassword 'android'
+                keyAlias 'key'
+                keyPassword 'android'
+              }
+            }
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+                minifyEnabled false
+                shrinkResources false
+              }
+            }
+            lint { abortOnError false; checkReleaseBuilds false }
+          }
+          EOF
+          cat > $A/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+            <application
+              android:label="@string/app_name"
+              android:icon="@android:drawable/sym_def_app_icon"
+              android:usesCleartextTraffic="true"
+              android:allowBackup="true"
+              android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+              <activity
+                android:name=".MainActivity"
+                android:exported="true"
+                android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                android:windowSoftInputMode="adjustResize">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          sed -i "s#@android:drawable/sym_def_app_icon#$ICON_RES#" $A/app/src/main/AndroidManifest.xml
+          cat > $A/app/src/main/java/com/htmlapk/web/MainActivity.java <<'EOF'
+          package com.htmlapk.web;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+            private WebView web;
+
+            @Override
+            protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              web = new WebView(this);
+              setContentView(web);
+              WebSettings s = web.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setDatabaseEnabled(true);
+              s.setAllowFileAccess(true);
+              s.setAllowFileAccessFromFileURLs(true);
+              s.setAllowUniversalAccessFromFileURLs(true);
+              s.setMediaPlaybackRequiresUserGesture(false);
+              s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+              web.setWebChromeClient(new WebChromeClient());
+              web.setWebViewClient(new WebViewClient() {
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                  String u = r.getUrl().toString();
+                  if (u.startsWith("file:") || u.startsWith("http:") || u.startsWith("https:")
+                      || u.startsWith("about:") || u.startsWith("data:") || u.startsWith("blob:")
+                      || u.startsWith("javascript:")) return false;
+                  try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u))); } catch (Exception e) { }
+                  return true;
+                }
+              });
+              if (b != null) web.restoreState(b);
+              else web.loadUrl("file:///android_asset/www/index.html");
+            }
+
+            @Override
+            protected void onSaveInstanceState(Bundle o) {
+              super.onSaveInstanceState(o);
+              web.saveState(o);
+            }
+
+            @Override
+            public void onBackPressed() {
+              if (web.canGoBack()) web.goBack(); else super.onBackPressed();
+            }
+          }
+          EOF
+
+      - name: Buat keystore
+        run: |
+          keytool -genkeypair -keystore /tmp/app.jks -storepass android -keypass android -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=HTML APK" > /dev/null 2>&1
+          echo "KS_FILE=/tmp/app.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          set -o pipefail
+          cd /tmp/app
+          for t in 1 2 3; do
+            gradle assembleRelease --no-daemon --parallel --build-cache --console=plain 2>&1 | tee /tmp/build-html.log && break
+            if [ "$t" -lt 3 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|timed out|Premature end|Received fatal alert|HTTP 5[0-9][0-9]' /tmp/build-html.log; then
+              echo "::warning::Gangguan jaringan, mengulang ($t/3)"; sleep 6
+            else
+              exit 1
+            fi
+          done
+          mkdir -p /tmp/out
+          N=${APP_TITLE// /_}
+          cp app/build/outputs/apk/release/app-release.apk "/tmp/out/${N}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: html-apk
+          path: /tmp/out/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
