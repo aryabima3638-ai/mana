@@ -1,0 +1,157 @@
+name: Build Android APK
+run-name: Build ${{ inputs.tag }} (android ${{ inputs.build_type }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+      build_type:
+        description: release atau debug
+        required: false
+        default: release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CI: 'true'
+    steps:
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "source.*" --dir source
+          cd source
+          F=$(ls source.* | head -1)
+          MAGIC=$(head -c 4 "$F" | od -An -tx1 | tr -d ' \n')
+          case "$MAGIC" in
+            504b*) unzip -q -o "$F" || 7z x -y "$F" > /dev/null ;;
+            1f8b*) tar xzf "$F" ;;
+            377abcaf) 7z x -y "$F" > /dev/null ;;
+            52617221) 7z x -y "$F" > /dev/null 2>&1 || bsdtar -xf "$F" 2>/dev/null || { sudo apt-get install -y -qq unrar-free > /dev/null 2>&1; unrar-free -x "$F" . > /dev/null; } ;;
+            *) tar xf "$F" ;;
+          esac
+          rm -f "$F"
+          ALL=$(find . -maxdepth 7 \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/node_modules/*' -not -path '*/__MACOSX/*' -not -path '*/.gradle/*' | awk '{print length, $0}' | sort -n | cut -d' ' -f2- || true)
+          S=$(echo "$ALL" | head -1)
+          if [ -z "$S" ]; then
+            S=$(grep -rlE 'com[.]android[.]application|android-application' --include=build.gradle --include=build.gradle.kts . 2>/dev/null | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2- || true)
+          fi
+          if [ -z "$S" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            if find . -maxdepth 4 -name pubspec.yaml | grep -q .; then echo "::error::Ini project Flutter. Pakai menu Build Flutter."; else echo "::error::Project Android (Gradle) tidak ditemukan: tidak ada settings.gradle. Zip folder project Android Studio (Java/Kotlin)."; fi
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$S")" && pwd)
+          echo "ANDROID_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Android root: $ROOT"
+
+      - name: Siapkan project (Java, SDK, wrapper)
+        run: |
+          cd "$ANDROID_ROOT"
+          rm -rf build .gradle app/build 2>/dev/null || true
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          # buang opsi Gradle usang yang membuat AGP baru error
+          if [ -f gradle.properties ]; then
+            sed -i -E '/^[[:space:]]*android[.](enableDexingArtifactTransform([.]desugaring)?|enableD8([.]desugaring)?|enableR8|useDeprecatedNdk|enableUnitTestBinaryResources|enableBuildCache|enableAapt2|enableSeparateAnnotationProcessing)[[:space:]]*=/d' gradle.properties
+          fi
+          # gradle wrapper hilang -> buat
+          if [ ! -f gradlew ]; then
+            echo "::notice::gradlew tidak ada, dibuat otomatis"
+            gradle wrapper --gradle-version 8.10.2 || true
+          fi
+          chmod +x gradlew 2>/dev/null || true
+          # pilih Java sesuai versi Gradle project
+          GV=$(grep -h distributionUrl gradle/wrapper/gradle-wrapper.properties 2>/dev/null | grep -oE 'gradle-[0-9]+[.][0-9]+' | head -1 | sed 's/gradle-//' || true)
+          GMAJ=$(echo "$GV" | cut -d. -f1); GMIN=$(echo "$GV" | cut -d. -f2)
+          JV=17
+          if [ -n "$GMAJ" ]; then
+            if [ "$GMAJ" -lt 5 ]; then JV=8
+            elif [ "$GMAJ" -eq 6 ] || { [ "$GMAJ" -eq 5 ] && true; } || { [ "$GMAJ" -eq 7 ] && [ "$GMIN" -lt 3 ]; }; then JV=11
+            fi
+          fi
+          JH=$(printenv "JAVA_HOME_${JV}_X64" || true)
+          [ -z "$JH" ] && JH=$(printenv JAVA_HOME_17_X64 || true)
+          echo "Gradle: ${GV:-?} -> Java $JV ($JH)"
+          if [ -n "$JH" ]; then
+            echo "JAVA_HOME=$JH" >> "$GITHUB_ENV"
+            echo "$JH/bin" >> "$GITHUB_PATH"
+          fi
+          # pasang platform SDK yang dibutuhkan project (jika belum ada)
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          for N in $(grep -rhoE 'compileSdk(Version)?[ =(]+[0-9]+' --include=build.gradle --include=build.gradle.kts . 2>/dev/null | grep -oE '[0-9]+$' | sort -un); do
+            if [ ! -d "$ANDROID_HOME/platforms/android-$N" ]; then
+              echo "Memasang platforms;android-$N"
+              sudo -E "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-$N" > /dev/null 2>&1 || sdkmanager "platforms;android-$N" > /dev/null 2>&1 || true
+            fi
+          done
+          # lewati lintVital (lambat)
+          mkdir -p ~/.gradle/init.d
+          echo 'allprojects { tasks.configureEach { t -> if (t.name.startsWith("lintVital") || t.name.startsWith("lintAnalyze") || t.name.startsWith("lintReport")) { t.enabled = false } } }' > ~/.gradle/init.d/skiplint.gradle
+          {
+            echo 'org.gradle.parallel=true'
+            echo 'org.gradle.caching=true'
+            echo 'org.gradle.vfs.watch=false'
+            echo 'kotlin.compiler.execution.strategy=in-process'
+          } >> ~/.gradle/gradle.properties
+
+      - name: Build APK
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          set -o pipefail
+          cd "$ANDROID_ROOT"
+          TYPE="${{ inputs.build_type }}"
+          if [ "$TYPE" = "debug" ]; then TASK=assembleDebug; else TASK=assembleRelease; fi
+          for t in 1 2 3; do
+            ./gradlew $TASK --no-daemon --parallel --build-cache --console=plain --stacktrace 2>&1 | tee /tmp/build-android.log && break
+            if [ "$t" -lt 3 ] && grep -Eiq 'Could not (resolve|GET|HEAD|download)|Connection (reset|refused)|Read timed out|Connect timed out|Premature end|Received fatal alert|HTTP 5[0-9][0-9]|Remote host terminated' /tmp/build-android.log; then
+              echo "::warning::Gangguan jaringan, mengulang ($t/3)"; sleep 6
+            else
+              exit 1
+            fi
+          done
+
+      - name: Kumpulkan & tanda tangani APK
+        run: |
+          set -e
+          cd "$ANDROID_ROOT"
+          mkdir -p /tmp/out /tmp/work
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          keytool -genkeypair -keystore /tmp/k.jks -storepass android -keypass android -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Build" > /dev/null 2>&1
+          find . -path '*/build/outputs/apk/*' -name '*.apk' -not -name '*androidTest*' -not -path '*/androidTest/*' | head -8 > /tmp/apks.txt
+          if [ ! -s /tmp/apks.txt ]; then
+            echo "::error::Build selesai tapi tidak ada file .apk (project mungkin library/AAB saja). Pastikan ada module com.android.application."
+            find . -path '*/build/outputs/*' | head -30 || true
+            exit 1
+          fi
+          while read -r f; do
+            N=$(basename "$f")
+            case "$N" in
+              *unsigned*)
+                OUTN="${N/-unsigned/}"
+                "$ANDROID_HOME/build-tools/$BT/zipalign" -f -p 4 "$f" /tmp/work/aligned.apk
+                "$ANDROID_HOME/build-tools/$BT/apksigner" sign --ks /tmp/k.jks --ks-pass pass:android --key-pass pass:android --ks-key-alias key --out "/tmp/out/${OUTN}" /tmp/work/aligned.apk
+                echo "Ditandatangani: $OUTN"
+                ;;
+              *) cp "$f" "/tmp/out/$N" ;;
+            esac
+          done < /tmp/apks.txt
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: /tmp/out/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
